@@ -1,0 +1,1367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Order Detail — Cope Aesthetic Customs</title>
+  <link rel="stylesheet" href="styles.css"/>
+</head>
+<body>
+<!--
+  PAGE: Admin Order Detail (admin-order-detail.html)
+  ============================================================
+  PURPOSE:
+    The full management view for a single order. This is where Buffy
+    does most of her daily work — updating status, logging payments,
+    uploading mockups, approving rush requests, and communicating notes.
+
+  HOW TO NAVIGATE HERE:
+    From admin-orders.html — click any row or the "Manage" button.
+    URL param: admin-order-detail.html?id=1047
+
+  WHAT'S ON THIS PAGE:
+    1. Hero — order header with pipeline bar and status dropdown
+    2. Rush approval section — only visible if rush is pending
+    3. Customer info + order details (2-column)
+    4. Payments table + "Log Payment" modal
+    5. Add-ons list + "Add Add-On" modal
+    6. Inbound tracking (customer → Buffy) — admin can override
+    7. Outbound tracking (Buffy → customer) — admin enters carrier + number
+    8. Base photo upload (drag/drop)
+    9. Customer reference photos (read-only gallery)
+   10. Mockup gallery + "Add Revision Note" modal
+   11. Revision history (free vs paid tracked)
+   12. Consult calls + "Schedule Consult" modal
+   13. Customer notes (read-only) + Admin notes (editable)
+   14. Status history timeline
+   15. Danger zone — quick status shortcuts
+
+  KEY FUNCTIONS:
+    render()         — rebuilds the entire page content from current state.
+                       Called after every mutation (status change, payment added, etc.)
+    updateStatus(val) — changes ORDER.status, appends to statusHist[], re-renders
+    approveRush()    — sets rush_approved on the current ORDER object
+    saveTracking()   — saves inbound or outbound tracking number
+    handleUpload()   — reads image files and adds them to mockupImgs[] or basePhoots[]
+    renderGallery()  — builds the thumbnail grid for any image array
+    openAddPayment() — dynamically creates and appends a payment modal to <body>
+    logPayment()     — pushes a new payment object to the payments[] array
+    openAddAddon()   — modal for adding an add-on service
+    openAddRevision() — modal for logging a revision (checks free vs paid threshold)
+    logRevision()    — pushes a new revision with correct charge_amount
+    openScheduleConsult() — modal for scheduling a consult call
+    saveNotes()      — saves admin notes back to ORDER.admin_notes
+    openLb() / closeLb() — lightbox for full-screen image viewing
+
+  BACKEND TODO:
+    render data      → GET /api/orders/:id (returns order + all related data)
+    updateStatus()   → PATCH /api/orders/:id  { status: 'painting' }
+    approveRush()    → PATCH /api/orders/:id  { rush_approved: true }
+    saveTracking()   → PATCH /api/orders/:id  { outbound_tracking: '...', outbound_carrier: '...' }
+    logPayment()     → POST /api/payments      { order_id, amount, type, method }
+    addAddon()       → POST /api/add_ons       { order_id, name, price, quantity }
+    logRevision()    → POST /api/revisions     { order_id, revision_number, notes, charge_amount }
+    saveConsult()    → POST /api/consult_calls { order_id, scheduled_at, duration_minutes, notes }
+    saveNotes()      → PATCH /api/orders/:id  { admin_notes: '...' }
+    image upload     → POST /api/order_images  (multipart form with file + type)
+  ============================================================
+-->
+<script src="core.js"></script>
+<script src="mock-backend.js"></script>
+<script src="navbar.js"></script>
+
+<div class="page">
+  <a href="admin-orders.html" class="back">← Back to Orders</a>
+  <div id="heroWrap"><div class="spin"></div></div>
+  <div id="mainContent" style="display:none;"></div>
+</div>
+
+<!-- LIGHTBOX -->
+<div class="lb" id="lb" onclick="closeLb()">
+  <button class="lb-x" onclick="closeLb()">✕</button>
+  <img id="lbImg" src="" alt="" onclick="event.stopPropagation()"/>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+  requireAdminAuth();
+  renderAdminNav('admin-orders.html');
+
+  const params = new URLSearchParams(location.search);
+  const OID = parseInt(params.get('id'));
+
+  // All state variables — populated by loadOrderDetail() below
+  let ORDER = {}, CUSTOMER = {}, USERS = {};
+  let detail = {};  // full API response — used by renderDocuments() for invoices
+  let custPhotos=[], basePhoots=[], mockupImgs=[], moodboardImgs=[], conceptImgs=[];
+  let mockups=[], revisions=[], payments=[], addons=[], statusHist=[], consults=[];
+
+  // Global error catcher — shows real error on page instead of silent spinner
+  window.onerror = function(msg, src, line, col, err) {
+    document.getElementById('heroWrap').innerHTML =
+      `<div style="padding:30px;background:rgba(231,76,60,0.08);border:1px solid rgba(231,76,60,0.3);border-radius:8px;margin-bottom:16px;">
+        <div style="font-weight:700;color:var(--err);margin-bottom:8px;">⚠ Page Error — please report this to your developer</div>
+        <div style="font-family:monospace;font-size:12px;color:var(--txt-m);white-space:pre-wrap;">${msg}\nLine ${line}:${col}\n${src}</div>
+        <a href="admin-orders.html" class="btn btn-out btn-sm" style="margin-top:12px;display:inline-flex;">← Back to Orders</a>
+      </div>`;
+    return false;
+  };
+
+  // Load all order data from the real API
+  async function loadOrderDetail() {
+    if (!OID) { window.location.href = 'admin-orders.html'; return; }
+    document.getElementById('heroWrap').innerHTML = `<div style="padding:30px;font-size:13px;color:var(--txt-m);">Loading order ${OID}...</div>`;
+    let result;
+    try {
+      result = await apiFetch('/api/orders/' + OID);
+    } catch(e) {
+      document.getElementById('heroWrap').innerHTML =
+        `<div style="padding:30px;color:var(--err);">Network error: ${e.message}</div>`;
+      return;
+    }
+    if (!result) {
+      document.getElementById('heroWrap').innerHTML =
+        `<div style="padding:30px;color:var(--err);">⚠ API returned null — token may be expired. <a href="admin-login.html">Log in again →</a></div>`;
+      return;
+    }
+    if (!result.ok) {
+      document.getElementById('heroWrap').innerHTML =
+        `<div style="padding:30px;color:var(--err);">⚠ API error ${result.status}: ${JSON.stringify(result.data)}<br/><a href="admin-orders.html">← Back</a></div>`;
+      return;
+    }
+    document.getElementById('heroWrap').innerHTML = `<div style="padding:30px;color:var(--ok);">✅ Data loaded — rendering...</div>`;
+    const d = result.data;
+    detail     = d;
+    ORDER      = d.order || {};
+    CUSTOMER   = d.customer || {};
+    USERS[CUSTOMER.id] = CUSTOMER;
+    // order_images in initial response has no url data (stripped for speed)
+    // We render the page first, then fetch images separately
+    mockups    = d.mockups || [];
+    revisions  = d.revisions || [];
+    payments   = d.payments || [];
+    addons     = d.add_ons || [];
+    statusHist = d.status_history || [];
+    consults   = d.consult_calls || [];
+
+    try {
+      render();
+    } catch(e) {
+      document.getElementById('heroWrap').innerHTML =
+        `<div style="padding:30px;background:rgba(231,76,60,0.08);border:1px solid rgba(231,76,60,0.3);border-radius:8px;">
+          <div style="font-weight:700;color:var(--err);margin-bottom:8px;">⚠ render() crashed — please report this</div>
+          <div style="font-family:monospace;font-size:12px;color:var(--txt-m);white-space:pre-wrap;">${e.message}\n${e.stack||''}</div>
+          <a href="admin-orders.html" class="btn btn-out btn-sm" style="margin-top:12px;display:inline-flex;">← Back to Orders</a>
+        </div>`;
+      return;
+    }
+    try { renderDocuments(); } catch(e) { console.error('renderDocuments:', e.message, e.stack); }
+
+    // Now fetch full image data separately so it doesn't block the page load
+    try {
+      const imgResult = await apiFetch('/api/orders/' + OID + '/images');
+      const allImgs = (imgResult && imgResult.ok) ? (imgResult.data || []) : [];
+      custPhotos    = allImgs.filter(i=>i.type==='reference');
+      basePhoots    = allImgs.filter(i=>i.type==='base_photo');
+      mockupImgs    = allImgs.filter(i=>i.type==='mockup');
+      moodboardImgs = allImgs.filter(i=>i.type==='moodboard');
+      conceptImgs   = allImgs.filter(i=>i.type==='concept_art');
+    } catch(e) {
+      console.error('Image load error:', e);
+      custPhotos = basePhoots = mockupImgs = moodboardImgs = conceptImgs = [];
+    }
+
+    try { renderGallery('refGal',       custPhotos,    false, 'reference');  } catch(e) { console.error('refGal:', e); }
+    try { renderGallery('baseGal',      basePhoots,    false, 'base_photo'); } catch(e) { console.error('baseGal:', e); }
+    try { renderGallery('moodboardGal', moodboardImgs, true,  'moodboard');  } catch(e) { console.error('moodboardGal:', e); }
+    try { renderGallery('conceptGal',   conceptImgs,   true,  'concept_art');} catch(e) { console.error('conceptGal:', e); }
+    try { renderGallery('mockupGal',    mockupImgs,    true,  'mockup');     } catch(e) { console.error('mockupGal:', e); }
+  }
+  const pip = ['free_waitlist','paid_waitlist','production_queue','prep','painting','completed','shipped','closed'];
+
+  loadOrderDetail().then(() => setupDropZonesAfterLoad());
+
+  function render() {
+    document.title = `Order ${ORDER.order_number} — ${CUSTOMER.name||''}`;
+
+    // HERO
+    const pidx = pip.indexOf(ORDER.status);
+    document.getElementById('heroWrap').innerHTML = `
+      <div class="card" style="margin-bottom:20px;padding:26px 28px;">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:16px;">
+          <div>
+            <div style="font-size:10px;font-weight:700;letter-spacing:3px;text-transform:uppercase;color:var(--txt-m);margin-bottom:5px;">Order ${ORDER.order_number}</div>
+            <div style="font-size:28px;font-weight:700;letter-spacing:1px;text-transform:uppercase;line-height:1;margin-bottom:10px;">${CUSTOMER.name||'—'}</div>
+            <div style="display:flex;gap:14px;flex-wrap:wrap;font-size:13px;color:var(--txt-m);">
+              <span>📦 ${ORDER.item_type}</span>
+              <span>🎨 ${ORDER.pricing_tier||'—'}</span>
+              <span>📅 ${formatDate(ORDER.created_at)}</span>
+              ${ORDER.must_have_by?`<span style="color:var(--warn);">⏰ Due ${formatDate(ORDER.must_have_by)}</span>`:''}
+              ${ORDER.is_rush?`<span style="color:var(--warn);font-weight:700;">⚡ RUSH${ORDER.rush_approved?' — Approved':' — PENDING APPROVAL'}</span>`:''}
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div>
+              <div class="fl" style="margin-bottom:5px;">Status</div>
+              <select class="fc" id="statusSel" style="min-width:170px;" onchange="updateStatus(this.value)">
+                ${pip.map(s=>`<option value="${s}" ${ORDER.status===s?'selected':''}>${STATUSES[s].label}</option>`).join('')}
+              </select>
+            </div>
+            <div style="margin-top:18px;">${statusBadge(ORDER.status)}</div>
+            <div style="margin-top:18px;">
+              <button class="btn btn-out btn-sm" onclick="openCustomerView()" title="Preview this order as the customer sees it">
+                👁 Customer View
+              </button>
+            </div>
+          </div>
+        </div>
+        <!-- PIPELINE -->
+        <div class="pipeline" style="margin-top:18px;">
+          <div class="pip-track">
+            ${pip.map((s,i)=>`
+              <div style="display:flex;align-items:center;flex-shrink:0;">
+                <div class="pip-node ${i<pidx?'past':i===pidx?'active':'future'}">${STATUSES[s].label}</div>
+                ${i<pip.length-1?`<div class="pip-conn ${i<pidx?'past':'future'}"></div>`:''}
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>`;
+
+    document.getElementById('mainContent').style.display = 'block';
+    document.getElementById('mainContent').innerHTML = buildContent();
+
+    // Re-attach drag/drop
+    setupDropZone('mockupDrop','mockupFile', imgs => { mockupImgs.push(...imgs); renderGallery('mockupGal',mockupImgs,true,'mockup'); });
+    setupDropZone('baseDrop','baseFile', imgs => { basePhoots.push(...imgs); renderGallery('baseGal',basePhoots,false,'base'); });
+  }
+
+  function buildContent() {
+    const totalPaid = payments.reduce((s,p)=>s+(p.status==='paid'?parseFloat(p.amount):0),0);
+    const freeRevs  = 3;
+    const usedRevs  = revisions.length;
+    const paidRevs  = Math.max(0, usedRevs - freeRevs);
+
+    return `
+    <!-- ROW 1: Customer + Order Info -->
+    <div class="g2" style="margin-bottom:18px;">
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--chr);"></span>Customer Info</div></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+          ${irow('Name', CUSTOMER.name||'—')}
+          ${irow('Email', CUSTOMER.email||'—')}
+          ${irow('Phone', CUSTOMER.phone||'—')}
+          ${irow('Member Since', formatDate(CUSTOMER.created_at))}
+          ${(()=>{
+            const ct = CUSTOMER.customer_type || 'individual';
+            const SPECIAL = {group:'👥 Group', influencer:'⭐ Influencer', nonprofit:'🤝 Non-Profit', organization:'🏢 Organization'};
+            const label = SPECIAL[ct];
+            if (!label) return '';
+            return `<div style="grid-column:1/-1;">
+              <div class="fl">Account Type</div>
+              <div style="display:inline-flex;align-items:center;gap:6px;margin-top:4px;padding:5px 10px;border-radius:20px;background:rgba(231,167,51,0.12);border:1px solid rgba(231,167,51,0.3);font-size:12px;font-weight:700;color:var(--gld);">
+                ${label}
+              </div>
+              <div style="font-size:11px;color:var(--txt-m);margin-top:4px;">Special account type — may qualify for group/collab pricing.</div>
+            </div>`;
+          })()}
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--gld);"></span>Order Details</div></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+          ${irow('Item Type', ORDER.item_type)}
+          ${irow('Pricing Tier', ORDER.pricing_tier||'—', true)}
+          ${irow('Must Have By', formatDate(ORDER.must_have_by)||'Not set')}
+          ${irow('Rush', ORDER.is_rush?(ORDER.rush_approved?'⚡ Approved':'⚡ Pending'):'No')}
+          ${ORDER.is_rush&&ORDER.rush_fee?irow('Rush Fee', formatCurrency(ORDER.rush_fee)):''}
+          ${irow('Booking Fee', ORDER.booking_fee_paid?'✔ Paid':'⚠ Unpaid', false, ORDER.booking_fee_paid?'var(--ok)':'var(--warn)')}
+        </div>
+      </div>
+    </div>
+
+    <!-- ROW 2: Rush Approval (if pending) -->
+    ${ORDER.is_rush && !ORDER.rush_approved ? `
+    <div style="margin-bottom:18px;padding:18px 20px;background:rgba(232,160,32,0.07);border:1px solid rgba(232,160,32,0.25);border-radius:10px;">
+      <div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--warn);margin-bottom:12px;">⚡ Rush Request Pending Approval</div>
+      <div style="font-size:13px;color:var(--txt-m);margin-bottom:14px;">Rush fee is calculated as 50% of the custom fee. Approve only if schedule allows.</div>
+      <div style="display:flex;gap:10px;">
+        <button class="btn btn-mg" onclick="approveRush(true)">✔ Approve Rush</button>
+        <button class="btn btn-err" onclick="approveRush(false)">✕ Deny Rush Request</button>
+      </div>
+    </div>` : ''}
+
+    <!-- ROW 3: Payments + Add-Ons -->
+    <div class="g2" style="margin-bottom:18px;">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title"><span class="card-dot" style="background:var(--ok);"></span>Payments</div>
+          <button class="btn btn-out btn-sm" onclick="openAddPayment()">+ Add Payment</button>
+        </div>
+        <table style="width:100%;font-size:13px;">
+          <thead><tr>
+            <th style="padding:8px 0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--txt-m);border-bottom:1px solid var(--b1);">Type</th>
+            <th style="padding:8px 0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--txt-m);border-bottom:1px solid var(--b1);">Amount</th>
+            <th style="padding:8px 0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--txt-m);border-bottom:1px solid var(--b1);">Method</th>
+            <th style="padding:8px 0;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--txt-m);border-bottom:1px solid var(--b1);">Status</th>
+          </tr></thead>
+          <tbody>
+            ${payments.map(p=>`<tr>
+              <td style="padding:9px 0;color:var(--txt-m);text-transform:capitalize;border-bottom:1px solid var(--b1);">${p.type}</td>
+              <td style="padding:9px 0;color:var(--gld);font-weight:700;border-bottom:1px solid var(--b1);">${formatCurrency(p.amount)}</td>
+              <td style="padding:9px 0;color:var(--txt-m);border-bottom:1px solid var(--b1);">${p.method||'—'}</td>
+              <td style="padding:9px 0;border-bottom:1px solid var(--b1);"><span style="color:${p.status==='paid'?'var(--ok)':'var(--warn)'};">${p.status}</span></td>
+            </tr>`).join('')}
+            <tr><td colspan="4" style="padding-top:10px;font-size:12px;color:var(--txt-m);">Total Paid: <strong style="color:var(--ok);">${formatCurrency(totalPaid)}</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title"><span class="card-dot" style="background:var(--vio-l);"></span>Add-Ons</div>
+          <button class="btn btn-out btn-sm" onclick="openAddAddon()">+ Add</button>
+        </div>
+        ${addons.length ? addons.map(a=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--b1);font-size:13px;">
+            <span style="color:var(--txt);">${a.name}</span>
+            <span style="color:var(--gld);">${formatCurrency(a.price)} × ${a.quantity}</span>
+          </div>`).join('') : '<div style="font-size:13px;color:var(--txt-d);padding:8px 0;">No add-ons selected.</div>'}
+      </div>
+    </div>
+
+    <!-- ROW 4: Tracking -->
+    <div class="g2" style="margin-bottom:18px;">
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--chr);"></span>Inbound Tracking <span style="font-size:10px;color:var(--txt-d);font-weight:400;letter-spacing:1px;text-transform:none;"> — Customer → Buffy</span></div></div>
+        <div style="background:var(--blk);border:1px solid var(--b1);border-radius:7px;padding:16px;margin-bottom:12px;">
+          <div class="fl">Tracking #</div>
+          <div class="track-num ${ORDER.inbound_tracking?'':'empty'}" id="inboundDisp">${ORDER.inbound_tracking||'Not yet provided'}</div>
+          ${ORDER.inbound_carrier?`<div style="font-size:11px;color:var(--txt-d);margin-top:3px;">${ORDER.inbound_carrier}</div>`:''}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="text" class="fc" id="inboundIn" placeholder="Enter or override tracking #" value="${ORDER.inbound_tracking||''}" style="flex:1;min-width:150px;letter-spacing:1.5px;"/>
+          <button class="btn btn-ghost btn-sm" onclick="saveTracking('inbound')">Save</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot"></span>Outbound Tracking <span style="font-size:10px;color:var(--txt-d);font-weight:400;letter-spacing:1px;text-transform:none;"> — Buffy → Customer</span></div></div>
+        <div style="background:var(--blk);border:1px solid var(--b1);border-radius:7px;padding:16px;margin-bottom:12px;">
+          <div class="fl">Tracking #</div>
+          <div class="track-num ${ORDER.outbound_tracking?'':'empty'}" id="outboundDisp">${ORDER.outbound_tracking||'Not yet entered'}</div>
+          ${ORDER.outbound_carrier?`<div style="font-size:11px;color:var(--txt-d);margin-top:3px;">${ORDER.outbound_carrier}</div>`:''}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="text" class="fc" id="outboundIn" placeholder="Enter outbound tracking #" value="${ORDER.outbound_tracking||''}" style="flex:1;min-width:120px;letter-spacing:1.5px;"/>
+          <select class="fc" id="carrierSel" style="width:auto;min-width:100px;">
+            <option value="">Carrier</option>
+            ${['USPS','UPS','FedEx','DHL'].map(c=>`<option ${(ORDER.outbound_carrier||'')==c?'selected':''}>${c}</option>`).join('')}
+          </select>
+          <button class="btn btn-mg btn-sm" onclick="saveTracking('outbound')">Save & Notify</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ROW 5: Base Photo + Customer References -->
+    <div class="g2" style="margin-bottom:18px;">
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--chr);"></span>Base Photo <span style="font-size:10px;color:var(--txt-d);font-weight:400;text-transform:none;"> — item as received</span></div></div>
+        <div class="drop-zone" id="baseDrop" style="margin-bottom:8px;">
+          <input type="file" id="baseFile" accept="image/*" multiple onchange="handleUpload(event,'base_photo')"/>
+          <div style="font-size:20px;opacity:0.3;margin-bottom:6px;">📷</div>
+          <div class="drop-txt">Upload base photo</div>
+          <div class="drop-sub">Photo of item before work begins</div>
+        </div>
+        <div class="gallery" id="baseGal"><div class="gmt">No base photo yet.</div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--chr);"></span>Customer Reference Photos</div></div>
+        <div class="gallery" id="refGal"><div class="gmt">No reference photos from customer.</div></div>
+      </div>
+    </div>
+
+    <!-- ROW 6: Moodboard -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="card-head">
+        <div class="card-title"><span class="card-dot" style="background:var(--mg);"></span>Moodboard
+          <span style="font-size:11px;font-weight:400;color:var(--txt-m);text-transform:none;letter-spacing:0;"> — overall aesthetic direction</span>
+        </div>
+      </div>
+      <div class="drop-zone" id="moodboardDrop" style="margin-bottom:14px;">
+        <input type="file" id="moodboardFile" accept="image/*" multiple onchange="handleUpload(event,'moodboard')"/>
+        <div style="font-size:20px;opacity:0.3;margin-bottom:6px;">🎨</div>
+        <div class="drop-txt">Upload moodboard images</div>
+        <div class="drop-sub">Color palettes, inspiration, overall vibe</div>
+      </div>
+      <div class="gallery" id="moodboardGal"><div class="gmt">No moodboard uploaded yet.</div></div>
+    </div>
+
+    <!-- ROW 7: Concept Art -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="card-head">
+        <div class="card-title"><span class="card-dot" style="background:var(--vio-l);"></span>Concept Art
+          <span style="font-size:11px;font-weight:400;color:var(--txt-m);text-transform:none;letter-spacing:0;"> — initial design sketches</span>
+        </div>
+      </div>
+      <div class="drop-zone" id="conceptDrop" style="margin-bottom:14px;">
+        <input type="file" id="conceptFile" accept="image/*" multiple onchange="handleUpload(event,'concept_art')"/>
+        <div style="font-size:20px;opacity:0.3;margin-bottom:6px;">✏️</div>
+        <div class="drop-txt">Upload concept art</div>
+        <div class="drop-sub">Sketches and initial design concepts</div>
+      </div>
+      <div class="gallery" id="conceptGal"><div class="gmt">No concept art uploaded yet.</div></div>
+    </div>
+
+    <!-- ROW 8: Mockup + Approval Status + Revisions -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="card-head">
+        <div class="card-title"><span class="card-dot"></span>Final Mockup
+          <span style="font-size:11px;font-weight:400;color:var(--txt-m);text-transform:none;letter-spacing:0;">
+            — ${usedRevs}/${freeRevs} free revisions used${paidRevs>0?` + ${paidRevs} paid`:''}
+          </span>
+        </div>
+        <button class="btn btn-out btn-sm" onclick="openAddRevision()">+ Add Revision Note</button>
+      </div>
+
+      ${mockups.length > 0 ? `
+        <div style="padding:10px 14px;border-radius:6px;margin-bottom:14px;${
+          mockups[mockups.length-1].approved
+            ? 'background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.25);'
+            : 'background:rgba(232,160,32,0.08);border:1px solid rgba(232,160,32,0.2);'
+        }display:flex;align-items:center;gap:10px;">
+          <span style="font-size:16px;">${mockups[mockups.length-1].approved ? '✅' : '⏳'}</span>
+          <div>
+            <div style="font-size:12px;font-weight:700;color:${mockups[mockups.length-1].approved?'var(--ok)':'var(--warn)'};">
+              ${mockups[mockups.length-1].approved ? 'Customer Approved' : 'Awaiting Customer Approval'}
+            </div>
+            ${mockups[mockups.length-1].approval_at
+              ? `<div style="font-size:11px;color:var(--txt-d);">Approved ${formatDatetime(mockups[mockups.length-1].approval_at)}</div>`
+              : `<div style="font-size:11px;color:var(--txt-d);">Uploaded — waiting for customer to review</div>`}
+          </div>
+        </div>` : ''}
+
+      <div class="drop-zone" id="mockupDrop" style="margin-bottom:14px;">
+        <input type="file" id="mockupFile" accept="image/*" multiple onchange="handleUpload(event,'mockup')"/>
+        <div style="font-size:20px;opacity:0.3;margin-bottom:6px;">🖼</div>
+        <div class="drop-txt">Upload mockup for customer approval</div>
+        <div class="drop-sub">Customer will see this and can approve or request changes</div>
+      </div>
+      <div class="gallery" id="mockupGal"><div class="gmt">No mockup uploaded yet.</div></div>
+
+      ${revisions.length ? `
+        <div style="margin-top:16px;border-top:1px solid var(--b1);padding-top:14px;">
+          <div class="fl" style="margin-bottom:10px;">Revision History</div>
+          ${revisions.map(r=>`
+            <div style="display:flex;gap:12px;padding:10px 0;border-bottom:1px solid var(--b1);font-size:13px;align-items:flex-start;${r.completed?'opacity:0.5;':''}">
+              <div style="width:24px;height:24px;border-radius:50%;background:${r.revision_number<=freeRevs?'rgba(46,204,113,0.1)':'rgba(232,160,32,0.1)'};color:${r.revision_number<=freeRevs?'var(--ok)':'var(--warn)'};display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex-shrink:0;">R${r.revision_number}</div>
+              <div style="flex:1;color:var(--txt-m);">
+                ${r.notes||'—'}
+                ${r.completed?`<span style="margin-left:6px;font-size:10px;font-weight:700;color:var(--ok);text-transform:uppercase;letter-spacing:1px;">✔ Done</span>`:''}
+              </div>
+              <div style="color:${r.charge_amount?'var(--warn)':'var(--txt-d)'};white-space:nowrap;font-size:11px;">${r.charge_amount?formatCurrency(r.charge_amount)+' fee':'Free'}</div>
+              <div style="color:var(--txt-d);font-size:11px;white-space:nowrap;">${formatDate(r.created_at)}</div>
+              <div style="display:flex;gap:4px;flex-shrink:0;">
+                <button class="btn btn-sm" style="background:rgba(46,204,113,0.1);color:var(--ok);border-color:rgba(46,204,113,0.25);font-size:10px;padding:3px 8px;"
+                  onclick="toggleRevisionComplete(${r.id},${!r.completed})" title="${r.completed?'Mark incomplete':'Mark complete'}">
+                  ${r.completed?'↩ Undo':'✔ Done'}
+                </button>
+                <button class="btn btn-sm btn-err" style="font-size:10px;padding:3px 8px;"
+                  onclick="deleteRevision(${r.id})" title="Delete revision">✕</button>
+              </div>
+            </div>`).join('')}
+        </div>` : ''}
+    </div>
+
+    <!-- ROW 7: Consult Calls -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="card-head">
+        <div class="card-title"><span class="card-dot" style="background:var(--vio-l);"></span>Consult Calls</div>
+        <button class="btn btn-out btn-sm" onclick="openScheduleConsult()">+ Schedule Consult</button>
+      </div>
+      ${consults.length ? consults.map(c=>`
+        <div style="display:flex;gap:14px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--b1);font-size:13px;">
+          <div style="font-size:20px;opacity:0.5;">📞</div>
+          <div>
+            <div style="font-weight:600;color:var(--txt);">${formatDatetime(c.scheduled_at)} · ${c.duration_minutes} min</div>
+            <div style="color:var(--txt-m);margin-top:3px;font-family:var(--fb);font-style:italic;font-size:15px;">${c.notes||'—'}</div>
+          </div>
+        </div>`).join('') : '<div style="font-size:13px;color:var(--txt-d);">No consult calls scheduled.</div>'}
+    </div>
+
+
+    <!-- ROW 7b: FEE BUILDER & DOCUMENTS -->
+    <div class="card" style="margin-bottom:18px;" id="invoicesCard">
+      <div class="card-head" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+        <div class="card-title"><span class="card-dot" style="background:var(--gld);"></span>Fees & Documents</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-out btn-sm" onclick="toggleFeeBuilder()" id="feeBuilderToggle">✏️ Build Fees</button>
+        </div>
+      </div>
+
+      <!-- FEE BUILDER PANEL (collapsed by default) -->
+      <div id="feeBuilderPanel" style="display:none;border-top:1px solid var(--b1);padding-top:18px;margin-top:6px;">
+        <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:2px;color:var(--txt-m);margin-bottom:14px;">Enter Fees</div>
+
+        <!-- Standard Fees Grid -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;" id="standardFeeGrid">
+          ${['booking_fee','rush_fee','cleaning_fee','custom_fee','final_balance'].map(k => `
+            <div>
+              <div class="fl" style="margin-bottom:4px;">${({booking_fee:'Booking Fee',rush_fee:'Rush Fee',cleaning_fee:'Cleaning Fee',custom_fee:'Custom Fee',final_balance:'Final Balance'})[k]}</div>
+              <div style="position:relative;margin-bottom:4px;">
+                <span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--txt-m);font-size:14px;">$</span>
+                <input type="number" min="0" step="0.01" class="fc" id="fee_${k}" placeholder="0.00"
+                  style="padding-left:22px;"
+                  value="${k==='booking_fee'?'50':k==='rush_fee'?(ORDER.rush_fee||''):''}"
+                  ${k==='booking_fee'||(!ORDER.is_rush&&k==='rush_fee')?'':''} />
+              </div>
+              <input type="text" class="fc fee-desc" id="fee_desc_${k}" placeholder="Description (shown on invoice)" style="font-size:12px;" />
+            </div>`).join('')}
+        </div>
+
+        <!-- Custom Add-Ons -->
+        <div style="margin-bottom:16px;">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;">
+            <div class="fl">Custom Add-Ons</div>
+            <button class="btn btn-ghost btn-sm" onclick="addCustomFeeRow()">+ Add Fee</button>
+          </div>
+          <div id="customFeeRows"></div>
+        </div>
+
+        <!-- Notes -->
+        <div style="margin-bottom:16px;">
+          <div class="fl" style="margin-bottom:4px;">Notes (optional — shown on document)</div>
+          <textarea class="fc" id="feeNotes" rows="2" placeholder="e.g. Balance due before shipping..."></textarea>
+        </div>
+
+        <!-- Totals preview + Generate buttons -->
+        <div style="background:rgba(216,188,132,0.06);border:1px solid rgba(216,188,132,0.15);border-radius:8px;padding:14px 16px;margin-bottom:14px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <span style="font-size:13px;color:var(--txt-m);">Total</span>
+            <span style="font-size:20px;font-weight:700;color:var(--gld);" id="feeTotalDisplay">$0.00</span>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <button class="btn btn-out btn-sm" onclick="generateDoc('estimate')" style="flex:1;min-width:120px;">📋 Generate Estimate</button>
+            <button class="btn btn-out btn-sm" onclick="generateDoc('invoice')"  style="flex:1;min-width:120px;">🧾 Generate Invoice</button>
+            <button class="btn btn-gld btn-sm" onclick="generateDoc('receipt')"  style="flex:1;min-width:120px;">✅ Generate Receipt</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- DOCUMENTS LIST -->
+      <div id="invoicesList" style="margin-top:${''};"></div>
+    </div>
+
+    <!-- ROW 8: Notes + Status History -->
+    <div class="g2" style="margin-bottom:18px;">
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--chr);"></span>Customer Notes</div></div>
+        <div style="font-family:var(--fb);font-style:italic;font-size:16px;color:var(--txt-m);line-height:1.7;">"${ORDER.customer_notes||'No notes from customer.'}"</div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--gld);"></span>Admin Notes</div></div>
+        <textarea class="fc" id="adminNotesTA" rows="4" placeholder="Internal notes...">${ORDER.admin_notes||''}</textarea>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:10px;">
+          <button class="btn btn-gld btn-sm" onclick="saveNotes()">Save Notes</button>
+          <span id="notesSv" style="font-size:12px;color:var(--ok);display:none;">✔ Saved</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- STATUS HISTORY -->
+    <div class="card" style="margin-bottom:18px;">
+      <div class="card-head"><div class="card-title"><span class="card-dot" style="background:var(--chr);"></span>Status History</div></div>
+      ${statusHist.length ? statusHist.map(h=>`
+        <div style="display:flex;gap:12px;align-items:flex-start;padding:10px 0;border-bottom:1px solid var(--b1);font-size:13px;">
+          <div style="width:6px;height:6px;border-radius:50%;background:var(--mg);flex-shrink:0;margin-top:5px;"></div>
+          <div>
+            <span style="color:var(--txt-m);">${STATUSES[h.from_status]?.label||h.from_status} →</span>
+            <strong> ${STATUSES[h.to_status]?.label||h.to_status}</strong>
+            ${h.note?`<div style="font-size:12px;color:var(--txt-m);margin-top:2px;">${h.note}</div>`:''}
+          </div>
+          <div style="margin-left:auto;font-size:11px;color:var(--txt-d);white-space:nowrap;">${formatDate(h.changed_at)}</div>
+        </div>`).join('') : '<div style="font-size:13px;color:var(--txt-d);">No status history yet.</div>'}
+    </div>
+
+    <!-- DANGER ZONE -->
+    <div class="card" style="border-color:rgba(231,76,60,0.2);">
+      <div class="card-head"><div class="card-title" style="color:var(--err);">⚠ Actions</div></div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        <button class="btn btn-out btn-sm" onclick="setStatus('completed')">✔ Mark Completed</button>
+        <button class="btn btn-out btn-sm" onclick="setStatus('shipped')">📦 Mark Shipped</button>
+        <button class="btn btn-out btn-sm" onclick="setStatus('closed')">🔒 Close Order</button>
+        <button class="btn btn-err btn-sm" onclick="setStatus('cancelled')">✕ Cancel Order</button>
+        ${['closed','shipped','cancelled'].includes(ORDER.status) ? `
+        <button class="btn btn-sm" style="background:rgba(107,47,190,0.12);color:var(--vio-l);border-color:rgba(107,47,190,0.3);" onclick="openArchiveModal()">🗃 Archive Order</button>
+        ` : ''}
+      </div>
+    </div>`;
+  }
+
+  // ============================================================
+  // FEE BUILDER + DOCUMENT GENERATION
+  // ============================================================
+
+  // Toggle the fee builder panel open/closed
+  function toggleFeeBuilder() {
+    const panel = document.getElementById('feeBuilderPanel');
+    const btn   = document.getElementById('feeBuilderToggle');
+    const open  = panel.style.display === 'none';
+    panel.style.display = open ? 'block' : 'none';
+    btn.textContent = open ? '✕ Close' : '✏️ Build Fees';
+    if (open) {
+      updateFeeTotal();
+      // Add live-update listeners
+      document.querySelectorAll('#standardFeeGrid input').forEach(inp => {
+        inp.addEventListener('input', updateFeeTotal);
+      });
+    }
+  }
+
+  // Add a custom fee row (label + amount pair)
+  let _customFeeCount = 0;
+  function addCustomFeeRow() {
+    _customFeeCount++;
+    const id  = 'cfr_' + _customFeeCount;
+    const div = document.createElement('div');
+    div.id    = id;
+    div.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px;';
+    div.innerHTML = `
+      <div style="display:flex;flex-direction:column;gap:4px;flex:2;">
+        <input type="text" class="fc custom-fee-name" placeholder="Fee name (e.g. Design Consultation)"
+          oninput="updateFeeTotal()" />
+        <input type="text" class="fc custom-fee-descr" placeholder="Description (shown on invoice)" style="font-size:12px;" />
+      </div>
+      <div style="position:relative;flex:1;">
+        <span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--txt-m);">$</span>
+        <input type="number" class="fc custom-fee-amt" min="0" step="0.01" placeholder="0.00"
+          style="padding-left:22px;" oninput="updateFeeTotal()" />
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('${id}').remove();updateFeeTotal();">✕</button>`;
+    document.getElementById('customFeeRows').appendChild(div);
+  }
+
+  // Recompute running total from all fee inputs
+  function updateFeeTotal() {
+    let total = 0;
+    ['booking_fee','rush_fee','cleaning_fee','custom_fee','final_balance'].forEach(k => {
+      const el = document.getElementById('fee_' + k);
+      if (el) total += parseFloat(el.value || 0);
+    });
+    document.querySelectorAll('.custom-fee-amt').forEach(el => {
+      total += parseFloat(el.value || 0);
+    });
+    const disp = document.getElementById('feeTotalDisplay');
+    if (disp) disp.textContent = formatCurrency(total);
+    return total;
+  }
+
+  // Collect all non-zero line items from the fee builder
+  function collectLineItems() {
+    const LABELS = {
+      booking_fee: 'Booking Fee', rush_fee: 'Rush Fee',
+      cleaning_fee: 'Cleaning Fee', custom_fee: 'Custom Fee',
+      final_balance: 'Final Balance'
+    };
+    const items = [];
+    ['booking_fee','rush_fee','cleaning_fee','custom_fee','final_balance'].forEach(k => {
+      const el   = document.getElementById('fee_' + k);
+      const dEl  = document.getElementById('fee_desc_' + k);
+      const amt  = el ? parseFloat(el.value || 0) : 0;
+      const desc = dEl ? dEl.value.trim() : '';
+      if (amt > 0) items.push({ label: LABELS[k], description: desc || LABELS[k], amount: amt });
+    });
+    // Custom rows
+    document.querySelectorAll('#customFeeRows > div').forEach(row => {
+      const nameEl  = row.querySelector('.custom-fee-name');
+      const descrEl = row.querySelector('.custom-fee-descr');
+      const amtEl   = row.querySelector('input[type="number"]');
+      const lbl     = nameEl  ? nameEl.value.trim()  : '';
+      const desc    = descrEl ? descrEl.value.trim() : '';
+      const amt     = amtEl   ? parseFloat(amtEl.value || 0) : 0;
+      if (lbl && amt > 0) items.push({ label: lbl, description: desc || lbl, amount: amt });
+    });
+    return items;
+  }
+
+  // Generate an estimate, invoice, or receipt PDF in-browser,
+  // save it to the DB, then re-render the documents list.
+  async function generateDoc(docType) {
+    const items = collectLineItems();
+    if (!items.length) { showToast('Enter at least one fee amount first.'); return; }
+
+    const notes = (document.getElementById('feeNotes') || {}).value || '';
+    const suffix = { estimate:'E', invoice:'I', receipt:'R' }[docType];
+    const docNum = `${ORDER.order_number}${suffix}`;
+    const subtotal = items.reduce((s,i) => s + i.amount, 0);
+    const docLabel = { estimate:'Estimate', invoice:'Invoice', receipt:'Receipt' }[docType];
+
+    // Build PDF HTML as a data-URL using print-friendly markup
+    const pdfHtml = buildDocHtml({ docType, docNum, docLabel, items, subtotal, notes, order: ORDER, customer: CUSTOMER });
+
+    // Open print dialog in a new window (acts as PDF export)
+    const win = window.open('', '_blank');
+    win.document.write(pdfHtml);
+    win.document.close();
+    win.focus();
+    setTimeout(() => win.print(), 600);
+
+    // Save to DB
+    try {
+      const res = await apiFetch('/api/orders/' + OID + '/invoices', {
+        method: 'POST',
+        body: JSON.stringify({ doc_type: docType, line_items: items, notes })
+      });
+      if (res && res.ok && res.data && res.data.invoice) {
+        detail.invoices = detail.invoices || [];
+        detail.invoices.unshift(res.data.invoice);
+        renderDocuments();
+        showToast(`${docLabel} #${docNum} saved! Use "Send to Customer" to share it.`);
+      }
+    } catch(e) {
+      showToast('Saved locally — check API connection.');
+    }
+  }
+
+  // Build print-ready HTML for the document
+  function buildDocHtml({ docType, docNum, docLabel, items, subtotal, notes, order, customer }) {
+    const isReceipt = docType === 'receipt';
+    const today = new Date().toLocaleDateString('en-US', { year:'numeric', month:'long', day:'numeric' });
+
+    const QR_PAYPAL  = img
+    const QR_VENMO   = img
+    const QR_CASHAPP = img
+    const LOGO_IMG   = img
+
+    const rows = items.map(i => `
+      <tr>
+        <td class="td-svc">${i.label}</td>
+        <td class="td-desc">${i.description || i.label}</td>
+        <td class="td-date">${today}</td>
+        <td class="td-amt">$${parseFloat(i.amount).toFixed(2)}</td>
+        <td class="td-amt">$${parseFloat(i.amount).toFixed(2)}</td>
+      </tr>`).join('');
+
+    const paymentSection = isReceipt ? '' : `
+      <div style="margin-top:28px;">
+        <div style="font-size:11px;font-weight:700;color:#333;margin-bottom:6px;">Payment options:</div>
+        <div style="font-size:11px;color:#333;margin-bottom:18px;">Cash, money order, certified/personal/business check (made payable to: Buffy Taylor, Cope Aesthetic), PayPal, Venmo, or Cash App</div>
+        <div style="display:flex;justify-content:space-around;align-items:flex-start;gap:20px;flex-wrap:wrap;">
+          <div style="text-align:center;"><img src="${QR_PAYPAL}" style="width:150px;display:block;margin:0 auto;"/></div>
+          <div style="text-align:center;"><img src="${QR_VENMO}" style="width:150px;display:block;margin:0 auto;"/></div>
+          <div style="text-align:center;"><img src="${QR_CASHAPP}" style="width:150px;display:block;margin:0 auto;"/></div>
+        </div>
+      </div>`;
+
+    return `<!DOCTYPE html><html><head><meta charset="UTF-8"/>
+      <title>${docLabel} #${docNum}</title>
+      <link rel="preconnect" href="https://fonts.googleapis.com"/>
+      <link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@900&display=swap" rel="stylesheet"/>
+      <style>
+        *{box-sizing:border-box;margin:0;padding:0;}
+        body{font-family:'Helvetica Neue',Arial,sans-serif;color:#111;background:#fff;padding:36px 44px;font-size:11px;}
+        .hdr{display:flex;align-items:center;gap:18px;margin-bottom:6px;}
+        .hdr-logo{height:52px;} .hdr-logo2{height:52px;object-fit:contain;}
+        .contact-bar{font-size:9.5px;color:#555;border-top:2px solid #e8c832;border-bottom:2px solid #e8c832;padding:4px 0;margin-bottom:14px;text-align:center;letter-spacing:0.3px;}
+        .meta-wrap{display:flex;margin-bottom:14px;border:1px solid #ccc;}
+        .meta-left,.meta-right{flex:1;padding:10px 12px;}
+        .meta-right{border-left:1px solid #ccc;}
+        .meta-row{display:flex;gap:6px;margin-bottom:4px;font-size:10px;}
+        .meta-lbl{font-weight:700;min-width:130px;text-transform:uppercase;font-size:10px;letter-spacing:0.5px;}
+        .meta-val{color:#333;}
+        table.items{width:100%;border-collapse:collapse;margin-bottom:0;font-size:11px;}
+        table.items th{background:#111;color:#fff;padding:8px 10px;text-align:left;font-size:10px;text-transform:uppercase;letter-spacing:1px;border:1px solid #111;}
+        table.items th.th-amt{text-align:center;}
+        table.items td{padding:10px 10px;border:1px solid #ccc;vertical-align:top;}
+        .td-svc{width:130px;font-weight:600;}
+        .td-date{width:90px;white-space:nowrap;}
+        .td-amt{width:80px;text-align:center;}
+        .stub-divider{border-top:2px dashed #bbb;margin:28px 0 16px;}
+        .stub{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;}
+        .stub-left{flex:1;}
+        .stub-from{font-size:10px;color:#777;margin-bottom:4px;}
+        .stub-name{font-size:12px;font-weight:600;}
+        .stub-addr{font-size:10px;color:#555;line-height:1.6;}
+        .stub-right{min-width:200px;border:1px solid #ccc;padding:10px 14px;}
+        .stub-right .srow{display:flex;justify-content:space-between;gap:16px;font-size:10px;padding:4px 0;border-bottom:1px solid #eee;}
+        .stub-right .srow:last-child{border-bottom:none;font-weight:700;font-size:12px;}
+        .stub-lbl{font-weight:700;text-transform:uppercase;font-size:9.5px;letter-spacing:0.5px;white-space:nowrap;}
+        .thankyou{text-align:right;font-size:22px;font-weight:900;color:#F217A5;text-transform:uppercase;letter-spacing:3px;margin-top:20px;font-family:'Cinzel Decorative','Palatino Linotype',Palatino,serif;font-style:normal;}
+        .footer-contact{text-align:center;font-size:8.5px;color:#aaa;margin-top:8px;border-top:1px solid #eee;padding-top:8px;}
+        @media print{body{padding:20px 28px;} .no-print{display:none;}}
+      </style>
+    </head><body>
+
+      <div class="hdr">
+        <img src="${LOGO_IMG}" class="hdr-logo" alt="Cope Aesthetic"/>
+        <span style="font-size:32px;color:#aaa;font-style:italic;font-weight:300;line-height:1;margin:0 8px;">&amp;</span>
+        <img src=
+      </div>
+      <div class="contact-bar">www.CopeAestheticCustoms.com | CopeAestheticCustoms@gmail.com | IG @CopeAestheticCustoms | FB @CopeAestheticCustoms</div>
+
+      <div class="meta-wrap">
+        <div class="meta-left">
+          <div class="meta-row"><span class="meta-lbl">${docLabel} Date:</span><span class="meta-val">${today}</span></div>
+          <div class="meta-row"><span class="meta-lbl">${docLabel} Number:</span><span class="meta-val">${docNum}</span></div>
+          <div class="meta-row"><span class="meta-lbl">Artist:</span><span class="meta-val">~buffy</span></div>
+          <div class="meta-row"><span class="meta-lbl">Company:</span><span class="meta-val">COPE AESTHETIC</span></div>
+          <div class="meta-row"><span class="meta-lbl">EIN:</span><span class="meta-val">83-1503881</span></div>
+        </div>
+        <div class="meta-right">
+          <div class="meta-row"><span class="meta-lbl">Client/Contact:</span><span class="meta-val">${customer.name || '\u2014'}</span></div>
+          <div class="meta-row"><span class="meta-lbl">Company:</span><span class="meta-val">${customer.company || '\u2014'}</span></div>
+          <div class="meta-row"><span class="meta-lbl">Address:</span><span class="meta-val">${customer.address || '\u2014'}</span></div>
+          <div class="meta-row"><span class="meta-lbl">Phone:</span><span class="meta-val">${customer.phone || '\u2014'}</span></div>
+        </div>
+      </div>
+
+      <table class="items">
+        <thead><tr>
+          <th>Service</th>
+          <th>Description</th>
+          <th>${docLabel} Date</th>
+          <th class="th-amt">Subtotal</th>
+          <th class="th-amt">Total</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+
+      <div style="text-align:right;padding:10px 10px 0;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;">
+        ${isReceipt ? 'Amount Paid' : 'Total Amount'}: <span style="font-size:15px;font-weight:800;margin-left:8px;">$${subtotal.toFixed(2)}</span>
+      </div>
+
+      ${notes ? `<div style="margin-top:14px;padding:10px 12px;background:#f9f9f9;border-left:3px solid #e8c832;font-size:11px;color:#555;">${notes}</div>` : ''}
+
+      ${paymentSection}
+
+      <div class="stub-divider"></div>
+      <div class="stub">
+        <div class="stub-left">
+          <div class="stub-from">${docLabel} from ~buffy:</div>
+          <div class="stub-name">Buffy Taylor</div>
+          <div class="stub-addr">—<br/>Pittsboro, NC 27312</div>
+          <div style="margin-top:10px;"><img src="${LOGO_IMG}" style="height:36px;" alt="Cope Aesthetic"/></div>
+        </div>
+        <div class="stub-right">
+          <div class="srow"><span class="stub-lbl">${docLabel} Date:</span><span>${today}</span></div>
+          <div class="srow"><span class="stub-lbl">${docLabel} Number:</span><span>${docNum}</span></div>
+          <div class="srow"><span class="stub-lbl">${isReceipt ? 'Amount Paid' : 'Amount Due'}:</span><span>$${subtotal.toFixed(2)}</span></div>
+        </div>
+      </div>
+
+      <div class="thankyou">Thank You!</div>
+      <div class="footer-contact">www.CopeAestheticCustoms.com | CopeAestheticCustoms@gmail.com | IG @CopeAestheticCustoms | FB @CopeAestheticCustoms</div>
+
+    </body></html>`;
+  }
+
+    // Render the saved documents list
+  function renderDocuments() {
+    const docs = (detail.invoices || []);
+    const el   = document.getElementById('invoicesList');
+    if (!el) return;
+
+    if (!docs.length) {
+      el.innerHTML = `<div style="font-size:13px;color:var(--txt-d);padding:16px 0;">No documents yet. Use the fee builder above to generate one.</div>`;
+      return;
+    }
+
+    const TYPE_ICON  = { estimate:'📋', invoice:'🧾', receipt:'✅' };
+    const TYPE_COLOR = { estimate:'var(--chr)', invoice:'var(--gld)', receipt:'var(--ok)' };
+
+    el.innerHTML = `
+      <div style="font-size:11px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--txt-m);padding:14px 0 8px;">Generated Documents</div>
+      ${docs.map(d => {
+        const icon  = TYPE_ICON[d.doc_type]  || '📄';
+        const color = TYPE_COLOR[d.doc_type] || 'var(--gld)';
+        const sent  = d.status === 'sent';
+        return `
+        <div style="display:flex;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid var(--b1);flex-wrap:wrap;">
+          <div style="width:36px;height:36px;border-radius:8px;background:rgba(216,188,132,0.1);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;">${icon}</div>
+          <div style="flex:1;min-width:160px;">
+            <div style="font-size:13px;font-weight:700;color:var(--txt);">${d.doc_type?d.doc_type.charAt(0).toUpperCase()+d.doc_type.slice(1):'Document'} — #${d.doc_number||''}</div>
+            <div style="font-size:12px;color:var(--txt-m);">
+              ${formatCurrency(d.subtotal||d.amount||0)} · ${(d.line_items||[]).length} line item${(d.line_items||[]).length!==1?'s':''}
+            </div>
+            ${d.line_items && d.line_items.length ? `
+              <div style="font-size:11px;color:var(--txt-d);margin-top:3px;">
+                ${d.line_items.map(li => li.label + ': ' + formatCurrency(li.amount)).join(' · ')}
+              </div>` : ''}
+          </div>
+          <div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:${sent?'var(--ok)':'var(--txt-d)'};">
+            ${sent ? '✔ Sent to Customer' : '○ Draft'}
+            ${sent && d.sent_at ? `<div style="font-weight:400;text-transform:none;font-size:10px;color:var(--txt-d);">${formatDate(d.sent_at)}</div>` : ''}
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;flex-shrink:0;">
+            <button class="btn btn-ghost btn-sm" onclick="previewDoc(${d.id})">👁 Preview</button>
+            ${!sent ? `<button class="btn btn-gld btn-sm" onclick="sendDoc(${d.id})">📧 Send to Customer</button>` : ''}
+            ${sent ? `<button class="btn btn-ghost btn-sm" onclick="sendDoc(${d.id})">📧 Resend</button>` : ''}
+            <button class="btn btn-ghost btn-sm" onclick="deleteDoc(${d.id})" style="color:var(--err);">✕</button>
+          </div>
+        </div>`;
+      }).join('')}
+      <div style="margin-top:12px;padding:10px 12px;background:rgba(216,188,132,0.06);border:1px solid rgba(216,188,132,0.12);border-radius:6px;font-size:12px;color:var(--txt-m);">
+        💡 "Send to Customer" makes the document visible in their portal.
+        <span style="color:var(--txt-d);">Email delivery coming soon via SendGrid.</span>
+      </div>`;
+  }
+
+  // Preview a saved doc (regenerate HTML from stored line items)
+  function previewDoc(docId) {
+    const d = (detail.invoices || []).find(i => i.id === docId);
+    if (!d) return;
+    const TYPE_LABEL = { estimate:'Estimate', invoice:'Invoice', receipt:'Receipt' };
+    const pdfHtml = buildDocHtml({
+      docType:   d.doc_type,
+      docNum:    d.doc_number,
+      docLabel:  TYPE_LABEL[d.doc_type] || 'Document',
+      items:     d.line_items || [],
+      subtotal:  d.subtotal || d.amount || 0,
+      notes:     d.notes || '',
+      order:     ORDER,
+      customer:  CUSTOMER,
+    });
+    const win = window.open('', '_blank');
+    win.document.write(pdfHtml);
+    win.document.close();
+  }
+
+  // Send a doc to the customer (mark as sent in DB)
+  async function sendDoc(docId) {
+    const d = (detail.invoices || []).find(i => i.id === docId);
+    if (!d) return;
+    const label = d.doc_type ? d.doc_type.charAt(0).toUpperCase()+d.doc_type.slice(1) : 'Document';
+    if (!confirm(`Send ${label} #${d.doc_number} to ${CUSTOMER.name||'customer'} (${CUSTOMER.email})?`)) return;
+    const res = await apiFetch('/api/invoices/' + docId + '/send', { method: 'POST' });
+    if (res && res.ok && res.data && res.data.invoice) {
+      const idx = detail.invoices.findIndex(i => i.id === docId);
+      if (idx >= 0) detail.invoices[idx] = res.data.invoice;
+      renderDocuments();
+      showToast(`${label} sent to customer! 📧`);
+    }
+  }
+
+  // Delete a doc
+  async function deleteDoc(docId) {
+    if (!confirm('Delete this document? This cannot be undone.')) return;
+    await apiFetch('/api/invoices/' + docId, { method: 'DELETE' });
+    detail.invoices = (detail.invoices || []).filter(i => i.id !== docId);
+    renderDocuments();
+    showToast('Document deleted.');
+  }
+
+  // ============================================================
+  // CUSTOMER VIEW — open customer portal for this order as admin preview
+  // ============================================================
+  async function openCustomerView() {
+    const res = await apiFetch('/api/admin/preview-token', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: ORDER.user_id })
+    });
+    if (res && res.ok && res.data && res.data.token) {
+      const url = `customer-order-detail.html?id=${OID}&preview_token=${res.data.token}`;
+      window.open(url, '_blank');
+    } else {
+      showToast('Could not open customer view — please try again.', 'error');
+    }
+  }
+
+  // Helper
+  function irow(label, val, cap=false, color='') {
+    return `<div><div class="fl">${label}</div><div style="font-size:14px;${cap?'text-transform:capitalize;':''}${color?`color:${color};`:''}">${val}</div></div>`;
+  }
+
+
+  function renderGallery(id, imgs, allowDel, type) {
+    const el = document.getElementById(id);
+    if(!el) return;
+    if(!imgs.length) { el.innerHTML=`<div class="gmt">No images yet.</div>`; return; }
+    el.innerHTML = imgs.map((img,i)=>{
+      const src = typeof img === 'string' ? img : (img.url || '');
+      const placeholder = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%22100%22 height=%22100%22%3E%3Crect fill=%22%231F1F1F%22 width=%22100%22 height=%22100%22/%3E%3Ctext fill=%22%23444%22 x=%2250%22 y=%2255%22 text-anchor=%22middle%22 font-size=%2212%22%3ENo image%3C/text%3E%3C/svg%3E';
+      return `
+      <div class="gthumb">
+        <img src="${src||placeholder}" onclick="openLb(this.src)"/>
+        ${allowDel?`<button class="gdel" onclick="delImg('${type}',${i})">✕</button>`:''}
+      </div>`;
+    }).join('');
+  }
+
+  const galleryMap = {
+    'moodboard':  { arr: () => moodboardImgs, setter: (v) => moodboardImgs = v, galId: 'moodboardGal' },
+    'concept_art':{ arr: () => conceptImgs,   setter: (v) => conceptImgs = v,   galId: 'conceptGal'   },
+    'mockup':     { arr: () => mockupImgs,    setter: (v) => mockupImgs = v,     galId: 'mockupGal'    },
+    'base_photo': { arr: () => basePhoots,    setter: (v) => basePhoots = v,     galId: 'baseGal'      },
+  };
+
+  function handleUpload(e, type) {
+    Array.from(e.target.files).forEach(f => {
+      const r = new FileReader();
+      r.onload = async ev => {
+        const url = ev.target.result;
+        // Save to API
+        const res = await apiFetch('/api/orders/' + OID + '/images', {
+          method: 'POST',
+          body: JSON.stringify({ url, type })
+        });
+        if (res && res.ok) {
+          const map = galleryMap[type];
+          if (map) {
+            // Store the full image object (with id) so we can delete it later
+            map.arr().push(res.data.image || { url, type });
+            renderGallery(map.galId, map.arr(), true, type);
+          }
+          showToast('Image uploaded!');
+          // Re-render full page if mockup uploaded (shows approval status)
+          if (type === 'mockup') {
+            const detail = await apiFetch('/api/orders/' + OID);
+            if (detail && detail.ok) {
+              mockups    = detail.data.mockups || [];
+              mockupImgs = (detail.data.order_images||[]).filter(i=>i.type==='mockup');
+              render();
+              renderGallery('mockupGal', mockupImgs, true, 'mockup');
+            }
+          }
+        } else {
+          showToast('Upload failed — image too large or server error.', 'error');
+        }
+      };
+      r.readAsDataURL(f);
+    });
+    e.target.value = '';
+  }
+
+  async function delImg(type, i) {
+    if (!confirm('Remove this image?')) return;
+    const map = galleryMap[type];
+    if (!map) return;
+    const img = map.arr()[i];
+    const imgId = typeof img === 'object' ? img.id : null;
+    // Delete from DB if we have an ID
+    if (imgId) {
+      const res = await apiFetch('/api/orders/' + OID + '/images/' + imgId, { method: 'DELETE' });
+      if (!res || !res.ok) {
+        showToast('Failed to delete image — please try again.', 'error');
+        return;
+      }
+    }
+    map.arr().splice(i, 1);
+    renderGallery(map.galId, map.arr(), true, type);
+    showToast('Image removed.');
+  }
+
+  function setupDropZone(zoneId, inputId, cb) {
+    const zone=document.getElementById(zoneId);
+    if(!zone) return;
+    zone.addEventListener('dragover',e=>{e.preventDefault();zone.classList.add('over');});
+    zone.addEventListener('dragleave',()=>zone.classList.remove('over'));
+    zone.addEventListener('drop',e=>{
+      e.preventDefault(); zone.classList.remove('over');
+      const imgs=[]; let done=0;
+      const files=Array.from(e.dataTransfer.files).filter(f=>f.type.startsWith('image/'));
+      if(!files.length) return;
+      files.forEach(f=>{
+        const r=new FileReader();
+        r.onload=ev=>{ imgs.push(ev.target.result); if(++done===files.length) cb(imgs); };
+        r.readAsDataURL(f);
+      });
+    });
+  }
+
+  async function updateStatus(val) {
+    const oldStatus = ORDER.status;
+    const res = await apiFetch('/api/orders/' + OID, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: val, note: 'Status updated by admin' })
+    });
+    if (!res || !res.ok) { showToast('Failed to update status', 'error'); return; }
+    ORDER.status = val;
+    statusHist.push({ id:Date.now(), order_id:OID, from_status:oldStatus, to_status:val, changed_at:new Date().toISOString(), note:'Updated by admin' });
+    renderAll();
+    showToast('Status → ' + (STATUSES[val]?.label||val));
+  }
+
+  function setStatus(val) {
+    if(!confirm(`Change status to "${STATUSES[val]?.label||val}"?`)) return;
+    document.getElementById('statusSel').value=val;
+    updateStatus(val);
+  }
+
+  async function approveRush(approved) {
+    const res = await apiFetch('/api/orders/' + OID, {
+      method: 'PATCH',
+      body: JSON.stringify({ rush_approved: approved, is_rush: approved ? ORDER.is_rush : false })
+    });
+    if (!res || !res.ok) { showToast('Failed to update rush status', 'error'); return; }
+    ORDER.rush_approved=approved;
+    if(!approved) ORDER.is_rush=false;
+    renderAll();
+    showToast(approved?'⚡ Rush approved!':'Rush denied.');
+  }
+
+  // renderAll() — call after any render() that changes page structure
+  // to repopulate all image galleries (render() wipes innerHTML)
+  function renderAll() {
+    render();
+    try { renderDocuments(); } catch(e) {}
+    renderGallery('refGal',       custPhotos,    false, 'reference');
+    renderGallery('baseGal',      basePhoots,    false, 'base_photo');
+    renderGallery('moodboardGal', moodboardImgs, true,  'moodboard');
+    renderGallery('conceptGal',   conceptImgs,   true,  'concept_art');
+    renderGallery('mockupGal',    mockupImgs,    true,  'mockup');
+    setupDropZone('mockupDrop','mockupFile', imgs => { mockupImgs.push(...imgs); renderGallery('mockupGal',mockupImgs,true,'mockup'); });
+    setupDropZone('baseDrop','baseFile', imgs => { basePhoots.push(...imgs); renderGallery('baseGal',basePhoots,false,'base'); });
+  }
+
+  function openArchiveModal() {
+    const modal = document.createElement('div');
+    modal.className = 'overlay open';
+    modal.id = 'archiveModal';
+    modal.innerHTML = `<div class="modal">
+      <button class="modal-x" onclick="document.getElementById('archiveModal').remove()">✕</button>
+      <div class="modal-title">🗃 Archive Order ${ORDER.order_number}</div>
+      <p style="font-size:13px;color:var(--txt-m);margin-bottom:20px;line-height:1.6;">
+        Archiving moves this order out of your active orders list. All order details, payments, revisions, and documents are always kept.<br/><br/>
+        <strong style="color:var(--txt);">What would you like to do with the photos?</strong><br/>
+        <span style="font-size:12px;color:var(--txt-d);">(reference photos, mockups, concept art, moodboard)</span>
+      </p>
+      <div style="display:flex;flex-direction:column;gap:10px;">
+        <button class="btn btn-out" onclick="archiveOrder(true)" style="justify-content:flex-start;padding:14px 16px;text-align:left;">
+          <div>
+            <div style="font-weight:700;margin-bottom:3px;">📸 Keep Photos</div>
+            <div style="font-size:12px;color:var(--txt-m);font-weight:400;">Save everything — photos stay in the database</div>
+          </div>
+        </button>
+        <button class="btn btn-out" onclick="archiveOrder(false)" style="justify-content:flex-start;padding:14px 16px;text-align:left;border-color:rgba(232,160,32,0.4);">
+          <div>
+            <div style="font-weight:700;margin-bottom:3px;color:var(--warn);">🗑 Delete Photos</div>
+            <div style="font-size:12px;color:var(--txt-m);font-weight:400;">Free up storage — photos are permanently deleted, all other details kept</div>
+          </div>
+        </button>
+      </div>
+    </div>`;
+    document.body.appendChild(modal);
+  }
+
+  async function archiveOrder(keepPhotos) {
+    document.getElementById('archiveModal')?.remove();
+    const res = await apiFetch(`/api/orders/${OID}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({ keep_photos: keepPhotos })
+    });
+    if (res && res.ok) {
+      showToast('✅ Order archived successfully.');
+      setTimeout(() => { window.location.href = 'admin-orders.html'; }, 1200);
+    } else {
+      showToast('Failed to archive order.', 'error');
+    }
+  }
+
+  async function toggleRevisionComplete(revId, completed) {
+    const res = await apiFetch('/api/revisions/' + revId, {
+      method: 'PATCH',
+      body: JSON.stringify({ completed })
+    });
+    if (res && res.ok) {
+      const idx = revisions.findIndex(r => r.id === revId);
+      if (idx >= 0) revisions[idx].completed = completed;
+      renderAll();
+      showToast(completed ? '✔ Revision marked complete!' : 'Revision reopened.');
+    } else {
+      showToast('Failed to update revision.', 'error');
+    }
+  }
+
+  async function deleteRevision(revId) {
+    if (!confirm('Delete this revision request? This cannot be undone.')) return;
+    const res = await apiFetch('/api/revisions/' + revId, { method: 'DELETE' });
+    if (res && res.ok) {
+      revisions = revisions.filter(r => r.id !== revId);
+      renderAll();
+      showToast('Revision deleted.');
+    } else {
+      showToast('Failed to delete revision.', 'error');
+    }
+  }
+
+  async function saveTracking(dir) {
+    if(dir==='inbound') {
+      const v=document.getElementById('inboundIn').value.trim();
+      if(!v){showToast('Enter tracking number first.','warning');return;}
+      const r = await apiFetch('/api/orders/'+OID, { method:'PATCH', body:JSON.stringify({inbound_tracking:v}) });
+      if(r&&r.ok){ORDER.inbound_tracking=v; showToast('Inbound tracking saved!'); render();}
+      else showToast('Save failed','error');
+    } else {
+      const v=document.getElementById('outboundIn').value.trim();
+      const c=document.getElementById('carrierSel').value;
+      if(!v){showToast('Enter tracking number first.','warning');return;}
+      const r = await apiFetch('/api/orders/'+OID, { method:'PATCH', body:JSON.stringify({outbound_tracking:v,outbound_carrier:c}) });
+      if(r&&r.ok){ORDER.outbound_tracking=v; ORDER.outbound_carrier=c; showToast('Outbound tracking saved!'); render();}
+      else showToast('Save failed','error');
+    }
+  }
+
+  async function saveNotes() {
+    const notes = document.getElementById('adminNotesTA').value;
+    const r = await apiFetch('/api/orders/'+OID, { method:'PATCH', body:JSON.stringify({admin_notes:notes}) });
+    const el=document.getElementById('notesSv');
+    if(r&&r.ok){ORDER.admin_notes=notes; el.style.display='inline'; setTimeout(()=>el.style.display='none',3000); showToast('Notes saved!');}
+    else showToast('Save failed','error');
+  }
+
+  function openAddPayment() {
+    const types=['booking','custom','rush','cleaning','revision','addon'];
+    const methods=['Zelle','Venmo','CashApp','PayPal','Other'];
+    const modal=document.createElement('div'); modal.className='overlay open'; modal.id='payModal';
+    modal.innerHTML=`<div class="modal">
+      <button class="modal-x" onclick="document.getElementById('payModal').remove()">✕</button>
+      <div class="modal-title">Log Payment</div>
+      <div class="fg"><label class="fl">Type</label><select class="fc" id="payType">${types.map(t=>`<option value="${t}" style="text-transform:capitalize;">${t}</option>`).join('')}</select></div>
+      <div class="fg"><label class="fl">Amount</label><input type="number" class="fc" id="payAmt" placeholder="0.00" min="0" step="0.01"/></div>
+      <div class="fg"><label class="fl">Method</label><select class="fc" id="payMethod">${methods.map(m=>`<option>${m}</option>`).join('')}</select></div>
+      <div class="fg"><label class="fl">External Transaction ID (optional)</label><input type="text" class="fc" id="payTxn" placeholder="Zelle confirmation #, etc."/></div>
+      <button class="btn btn-mg" style="width:100%;justify-content:center;margin-top:8px;" onclick="logPayment()">Log Payment</button>
+    </div>`;
+    document.body.appendChild(modal);
+  }
+
+  async function logPayment() {
+    const amt=parseFloat(document.getElementById('payAmt').value);
+    if(!amt){showToast('Enter a valid amount.','warning');return;}
+    const r = await apiFetch('/api/payments', { method:'POST', body:JSON.stringify({
+      order_id:OID, amount:amt,
+      type:document.getElementById('payType').value,
+      method:document.getElementById('payMethod').value,
+      status:'paid',
+      external_txn_id:document.getElementById('payTxn').value||''
+    })});
+    if(r&&r.ok){
+      payments.push(r.data.payment);
+      document.getElementById('payModal').remove();
+      renderAll(); showToast('Payment logged!');
+    } else showToast('Failed to log payment','error');
+  }
+
+  function openAddAddon() {
+    const modal=document.createElement('div'); modal.className='overlay open'; modal.id='addonModal';
+    modal.innerHTML=`<div class="modal">
+      <button class="modal-x" onclick="document.getElementById('addonModal').remove()">✕</button>
+      <div class="modal-title">Add Add-On Service</div>
+      <div class="fg"><label class="fl">Service Name</label>
+        <select class="fc" id="addonName">
+          <option>AI Product Photography ($35)</option>
+          <option>Rush Processing</option>
+          <option>Extra Revision ($20)</option>
+          <option>Cleaning Fee ($25)</option>
+          <option>Custom Add-On</option>
+        </select>
+      </div>
+      <div class="fg"><label class="fl">Price</label><input type="number" class="fc" id="addonPrice" placeholder="35.00" min="0" step="0.01"/></div>
+      <div class="fg"><label class="fl">Quantity</label><input type="number" class="fc" id="addonQty" value="1" min="1"/></div>
+      <button class="btn btn-mg" style="width:100%;justify-content:center;margin-top:8px;" onclick="addAddon()">Add</button>
+    </div>`;
+    document.body.appendChild(modal);
+  }
+
+  async function addAddon() {
+    const r = await apiFetch('/api/add_ons', { method:'POST', body:JSON.stringify({
+      order_id:OID,
+      name:document.getElementById('addonName').value,
+      price:parseFloat(document.getElementById('addonPrice').value)||0,
+      quantity:parseInt(document.getElementById('addonQty').value)||1
+    })});
+    if(r&&r.ok){
+      addons.push(r.data.add_on);
+      document.getElementById('addonModal').remove();
+      render(); showToast('Add-on added!');
+    } else showToast('Failed to add add-on','error');
+  }
+
+  function openAddRevision() {
+    const usedRevs=revisions.length, freeRevs=3;
+    const isPaid=usedRevs>=freeRevs;
+    const modal=document.createElement('div'); modal.className='overlay open'; modal.id='revModal';
+    modal.innerHTML=`<div class="modal">
+      <button class="modal-x" onclick="document.getElementById('revModal').remove()">✕</button>
+      <div class="modal-title">Add Revision Note</div>
+      ${isPaid?`<div style="padding:10px 12px;background:rgba(232,160,32,0.1);border:1px solid rgba(232,160,32,0.25);border-radius:6px;font-size:12px;color:var(--warn);margin-bottom:16px;">This revision (${usedRevs+1}) exceeds the 3 free included — a charge will apply.</div>`:''}
+      <div class="fg"><label class="fl">Revision Notes</label><textarea class="fc" id="revNotes" rows="4" placeholder="Describe what changes are needed..."></textarea></div>
+      ${isPaid?`<div class="fg"><label class="fl">Charge Amount</label><input type="number" class="fc" id="revCharge" placeholder="20.00" value="20" min="0" step="0.01"/></div>`:''}
+      <button class="btn btn-mg" style="width:100%;justify-content:center;margin-top:8px;" onclick="logRevision()">Save Revision</button>
+    </div>`;
+    document.body.appendChild(modal);
+  }
+
+  async function logRevision() {
+    const notes = document.getElementById('revNotes').value.trim();
+    if (!notes) { showToast('Please enter revision notes.', 'warning'); return; }
+    const chargeEl = document.getElementById('revCharge');
+    const charge_amount = chargeEl ? parseFloat(chargeEl.value) || 20 : 0;
+    const r = await apiFetch('/api/revisions', { method:'POST', body:JSON.stringify({
+      order_id: OID,
+      notes,
+      charge_amount,
+    })});
+    if (r && r.ok) {
+      revisions.push(r.data.revision);
+      document.getElementById('revModal').remove();
+      renderAll();
+      showToast('Revision #' + revisions.length + ' logged!');
+    } else {
+      showToast('Failed to log revision', 'error');
+    }
+  }
+
+  function openScheduleConsult() {
+    const modal=document.createElement('div'); modal.className='overlay open'; modal.id='consultModal';
+    modal.innerHTML=`<div class="modal">
+      <button class="modal-x" onclick="document.getElementById('consultModal').remove()">✕</button>
+      <div class="modal-title">Schedule Consult Call</div>
+      <div class="fg"><label class="fl">Date & Time</label><input type="datetime-local" class="fc" id="consultDt"/></div>
+      <div class="fg"><label class="fl">Duration (minutes)</label><select class="fc" id="consultDur"><option value="15">15 min</option><option value="30" selected>30 min</option><option value="45">45 min</option><option value="60">60 min</option></select></div>
+      <div class="fg"><label class="fl">Call Topic / Notes</label><textarea class="fc" id="consultNotes" rows="3" placeholder="What will you discuss?"></textarea></div>
+      <button class="btn btn-mg" style="width:100%;justify-content:center;margin-top:8px;" onclick="saveConsult()">Schedule</button>
+    </div>`;
+    document.body.appendChild(modal);
+  }
+
+  async function saveConsult() {
+    const dt=document.getElementById('consultDt').value;
+    if(!dt){showToast('Select a date and time.','warning');return;}
+    const r = await apiFetch('/api/consult_calls', { method:'POST', body:JSON.stringify({
+      order_id:OID,
+      scheduled_at:new Date(dt).toISOString(),
+      duration_minutes:parseInt(document.getElementById('consultDur').value),
+      notes:document.getElementById('consultNotes').value
+    })});
+    if(r&&r.ok){
+      consults.push(r.data.consult_call);
+      document.getElementById('consultModal').remove();
+      render(); showToast('Consult scheduled!');
+    } else showToast('Failed to schedule consult','error');
+  }
+
+  function openLb(src) { document.getElementById('lbImg').src=src; document.getElementById('lb').classList.add('open'); }
+  function closeLb()   { document.getElementById('lb').classList.remove('open'); }
+  document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeLb(); });
+
+  function setupDropZonesAfterLoad() {
+    // Galleries already rendered in loadOrderDetail
+    // Set up drop zones for Buffy's upload sections
+    setupDropZone('moodboardDrop','moodboardFile', imgs => {
+      moodboardImgs.push(...imgs);
+      renderGallery('moodboardGal', moodboardImgs, true, 'moodboard');
+    });
+    setupDropZone('conceptDrop','conceptFile', imgs => {
+      conceptImgs.push(...imgs);
+      renderGallery('conceptGal', conceptImgs, true, 'concept_art');
+    });
+    setupDropZone('mockupDrop','mockupFile', imgs => {
+      mockupImgs.push(...imgs);
+      renderGallery('mockupGal', mockupImgs, true, 'mockup');
+    });
+    setupDropZone('baseDrop','baseFile', imgs => {
+      basePhoots.push(...imgs);
+      renderGallery('baseGal', basePhoots, false, 'base_photo');
+    });
+  }
+</script>
+</body>
+</html>
